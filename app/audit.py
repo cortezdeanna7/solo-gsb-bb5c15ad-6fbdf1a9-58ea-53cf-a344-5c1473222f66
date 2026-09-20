@@ -67,6 +67,35 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def event_payload(
+    merge_id: str,
+    seq: int,
+    method: str,
+    revision_before: int,
+    revision_after: int,
+    pointers: list,
+    detail: dict,
+    prev_hash: str,
+    created_at: str,
+) -> dict:
+    """Public wrapper for the canonical payload an event hash commits to.
+
+    Lets non-database code (portable evidence verification) re-hash an event
+    presented as plain JSON using exactly the same field set as storage.
+    """
+    return _payload(
+        merge_id,
+        seq,
+        method,
+        revision_before,
+        revision_after,
+        pointers,
+        detail,
+        prev_hash,
+        created_at,
+    )
+
+
 def _payload(
     merge_id: str,
     seq: int,

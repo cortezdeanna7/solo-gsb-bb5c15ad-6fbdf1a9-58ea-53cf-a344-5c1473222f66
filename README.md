@@ -4,11 +4,21 @@
 
 ## 快速启动（单条命令）
 
+可移植证据包使用 HMAC-SHA256 签名，**必须**配置一个长度至少 32 字符的密钥（环境变量 `EVIDENCE_SECRET_KEY`）；未配置、为空或过短时应用会**启动失败**（这是有意为之的 fail-closed 行为）。单条命令启动前先提供密钥（任选其一）：
+
 ```bash
+# 方式一：Shell 环境变量
+export EVIDENCE_SECRET_KEY="$(openssl rand -hex 32)"   # 任意 >=32 字符的随机字符串
+docker compose up --build
+
+# 方式二：项目根目录的 .env 文件（docker compose 会自动读取）
+echo 'EVIDENCE_SECRET_KEY=至少32个字符的长密钥请妥善保管' > .env
 docker compose up --build
 ```
 
-依赖安装（镜像构建时，含 `jsonschema` Draft 2020-12 校验）与 SQLite 建表（应用启动时）自动完成，无需任何额外步骤。
+依赖安装（镜像构建时，含 `jsonschema` Draft 2020-12 校验）与 SQLite 建表（应用启动时）自动完成，密钥检查也在启动时完成，无需任何额外步骤。
+
+> 安全提示：密钥用于证据包的导出签名与离线校验，**不会**被写入数据库或响应；轮换密钥后，旧密钥签发的证据包将无法通过新密钥校验。请通过带外渠道把密钥分发给证据包的校验方。
 
 - **API 地址**：http://localhost:8000
 - **交互式文档（Swagger UI）**：http://localhost:8000/docs
@@ -55,6 +65,8 @@ SQLite 数据文件持久化在名为 `merge-data` 的 Docker volume 中（容�
 | `POST` | `/merges/{merge_id}/drafts/{draft_id}/commit` | 单事务提交草案：重校验后一次性应用全部取值并使草案失效 |
 | `GET` | `/merges/{merge_id}/patch` | resolved 后：base → result 的 RFC 6902 补丁（含 SHA-256） |
 | `GET` | `/merges/{merge_id}/audit` | 裁决审计链：按序返回全部裁决事件及逐合并单 SHA-256 链校验结果 |
+| `GET` | `/merges/{merge_id}/evidence` | resolved 后：导出**可移植证据包**（base、不可变 result、确定性补丁、完整审计链、生成时间 + HMAC-SHA256 签名） |
+| `POST` | `/evidence/verify` | **不访问数据库**的证据包离线校验：签名 → 审计链连续性 → 实际重放补丁，按固定顺序返回首个失败阶段 |
 | `GET` | `/health` | 健康检查 |
 
 ### 1. 创建合并单 — `POST /merges`
@@ -555,7 +567,87 @@ curl -s http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/audit
 - 合并单不存在 → **`404`**。
 - 既有接口的响应体不因审计模块增加任何字段，完全保持兼容。
 
-### 11. 合并前影响分析 — `POST /merge-analysis`
+### 11. 可移植证据包（导出与离线校验）
+
+合并单 `resolved` 后，可导出一份**自包含、规范化、带签名的可移植证据包**，把“原始 base → 不可变 result”这一裁决结果连同完整审计证据一起交给第三方；第三方无需访问本服务的数据库即可验证。
+
+#### 导出 — `GET /merges/{merge_id}/evidence`
+
+仅接受 **resolved** 合并单：`pending` → **`409`**，不存在 → **`404`**。成功响应（键顺序固定，整体即规范化载荷）：
+
+```json
+{
+  "merge_id": "…",
+  "status": "resolved",
+  "generated_at": "2026-09-20T03:36:35.700123+00:00",
+  "algorithm": "HMAC-SHA256",
+  "base":   { "…": "原始 base_doc（不可变）" },
+  "result": { "…": "合并单的不可变最终结果" },
+  "patch":  [ { "op": "replace", "path": "/db/host", "value": "b" } ],
+  "audit": {
+    "merge_id": "…",
+    "event_count": 2,
+    "genesis_prev_hash": "0000…（64 个 0）",
+    "events": [ { "seq": 1, "method": "resolutions", "…": "与 GET .../audit 相同的完整事件（不含 per-event valid 字段）" } ]
+  },
+  "signature": "9f2c…（64 位十六进制 HMAC-SHA256）"
+}
+```
+
+- **`patch`** 即 `GET .../patch` 的确定性 RFC 6902 操作序列（路径字典序）；**`base`、`result`、`patch`** 三者都原样进入签名载荷。
+- **`audit.events`** 是完整裁决审计链（事件字段与 `GET .../audit` 一致），包括每个事件的 `prev_hash` / `hash`。
+- **`signature` = HMAC-SHA256(`EVIDENCE_SECRET_KEY`, 规范化JSON(除 signature 外的全部字段))**；规范化 JSON 与文档摘要一致（键排序、无空白）。
+- 合并单不随时间变化时，重复导出除 `generated_at`/`signature` 外逐字段一致；密钥不变则签名只随时间戳变化。
+
+```bash
+curl -s http://localhost:8000/merges/461579…/evidence | tee evidence.json
+```
+
+#### 离线校验 — `POST /evidence/verify`
+
+请求体即上面导出的完整 JSON。接口是**纯函数**：只使用请求体与服务端配置的密钥，**不读取数据库**（证据包可以在另一台持有相同密钥的机器上校验）。校验按**固定顺序**分三阶段执行，并返回**首个**失败阶段及原因（之后的阶段不再执行）：
+
+| 顺序 | 阶段 | 校验内容 |
+| --- | --- | --- |
+| 1 | `signature` | 结构可解析、`algorithm` 受支持、`signature` 为十六进制；用密钥重算 HMAC，并用**常量时间比较**（`hmac.compare_digest`）逐字节比对 |
+| 2 | `audit_chain` | 事件 `seq` 从 1 连续；每个事件的 `prev_hash` 指向前一个**已验证**事件（首条指向 64 个 0 的创世哈希）；逐条按库存字段重算 SHA-256 与 `hash` 一致；事件均属于本合并单 |
+| 3 | `patch_replay` | **实际**把 RFC 6902 patch 重放到 `base` 上，要求结果与 `result` 严格相等（`1` ≠ `true`）；并重算确定性 base→result 补丁，要求与载荷中的补丁逐操作一致 |
+
+成功：
+
+```json
+{ "valid": true, "stage": null, "reason": null, "merge_id": "…", "event_count": 2 }
+```
+
+失败（始终 `200`；非 JSON 报文在第 1 阶段失败）：
+
+```json
+{ "valid": false, "stage": "audit_chain", "reason": "event seq 2 hash does not match its payload", "first_invalid_seq": 2 }
+```
+
+```bash
+curl -s -X POST http://localhost:8000/evidence/verify \
+  -H 'Content-Type: application/json' --data @evidence.json
+```
+
+- 篡改 base/result/patch/audit 任一字段（即使重新拼回表面一致的数据）：若不重签 → 第 1 阶段失败；若攻击者持有密钥并重签，补丁重放或审计链阶段仍会抓到不一致。
+- 伪造签名（空串、全 0、其他密钥重签未篡改内容）→ `signature` 阶段失败。
+- 篡改/删除/跳号审计事件，或事件不属于本合并单 → `audit_chain` 阶段失败，`first_invalid_seq` 指出首个异常事件。
+- 错误补丁（错误 value、指向不存在的路径、非法操作、非确定性操作序列）→ `patch_replay` 阶段失败。
+- 多阶段同时被破坏时，只报告固定顺序中最靠前的失败阶段。
+- 无冲突、创建即 resolved 的合并单审计链为空（`event_count: 0`），空链视为连续有效。
+
+#### 密钥配置（必需）
+
+| 项 | 值 |
+| --- | --- |
+| 环境变量 | `EVIDENCE_SECRET_KEY` |
+| 最小长度 | 32 个 UTF-8 字节 |
+| 缺失 / 空白 / 过短 | **应用启动失败**（lifespan 报错，端口不监听） |
+
+本地开发可 `export EVIDENCE_SECRET_KEY="0123456789abcdef0123456789abcdef"`（32 字符）；Docker Compose 部署见文档顶部的快速启动（shell `export` 或项目根目录 `.env` 文件）。`docker-compose.yml` 通过 `${EVIDENCE_SECRET_KEY:?...}` 要求该变量存在，缺密钥时 `docker compose up` 会直接失败并给出提示。
+
+### 12. 合并前影响分析 — `POST /merge-analysis`
 
 创建合并单之前，可用与 `POST /merges` **完全相同的 `base` / `left` / `right`** 先做一次纯试算：服务按 JSON Pointer 联合遍历三份文档，返回每个**最小变更路径**的 change record 及其分类，并给出分类计数与 `would_conflict`。接口**不落任何库**（不创建合并单、不写审计、无 revision），天然幂等：**相同请求重复发送，响应逐字节一致**。
 
@@ -626,8 +718,9 @@ curl -s -X POST http://localhost:8000/merge-analysis \
 ```bash
 pip install -r requirements.txt
 pip install httpx pytest
+export EVIDENCE_SECRET_KEY="0123456789abcdef0123456789abcdef"  # >=32 字符，必填
 uvicorn app.main:app --reload --port 8000   # 本地运行
-python -m pytest tests/ -q                  # 运行测试（188 项）
+python -m pytest tests/ -q                  # 运行测试（225 项）
 ```
 
 ## 项目结构
@@ -640,13 +733,14 @@ app/
   rules.py      # RFC 6901 风格路径模式（* 与 **）：规则编译、匹配、批量裁决
   reuse.py      # 历史裁决复用：指针 + base/left/right/missing 规范化匹配、来源结果取值/删除
   undo.py       # 撤销上一批裁决：初始快照 + 审计事件重放重建文档与开放冲突
-  patch.py      # 确定性 RFC 6902 补丁生成 + 规范化 SHA-256
+  patch.py      # 确定性 RFC 6902 补丁生成 + 严格 RFC 6902 重放器 + 规范化 SHA-256
+  evidence.py   # 可移植证据包：规范化载荷、HMAC-SHA256 签名、密钥启动门禁、无数据库三阶段校验（签名→审计链→补丁重放）
   validation.py # Draft 2020-12 结果门禁：元 schema 校验 + 最终结果校验（422 错误排序）
   audit.py      # 裁决审计：同事务事件追加 + 逐合并单 SHA-256 哈希链校验
-  store.py      # 合并单状态机 + 解决草案 + 历史复用 + 撤销：revision 校验、冲突解决、不可变结果、schema 门禁
+  store.py      # 合并单状态机 + 解决草案 + 历史复用 + 撤销 + 证据包导出：revision 校验、冲突解决、不可变结果、schema 门禁
   db.py         # SQLite 连接与建表（启动时执行，含轻量列迁移、审计表 CHECK 扩展与单事务提交支持）
   models.py     # Pydantic 请求模型（含可选 result_schema、草案编辑、历史复用、撤销请求）
-tests/          # 合并引擎/补丁单测 + API 端到端测试（含 schema 门禁、草案、历史复用、审计链与撤销重放测试）
+tests/          # 合并引擎/补丁单测 + API 端到端测试（含 schema 门禁、草案、历史复用、审计链、撤销重放与证据包篡改/伪造/断链/错误补丁测试）
 Dockerfile
 docker-compose.yml
 requirements.txt

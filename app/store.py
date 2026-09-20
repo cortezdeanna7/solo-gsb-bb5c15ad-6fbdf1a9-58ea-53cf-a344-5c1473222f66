@@ -135,6 +135,37 @@ def get_merge_patch(merge_id: str) -> dict:
     }
 
 
+def export_evidence_package(merge_id: str) -> dict:
+    """Build the signed, portable evidence package of a resolved merge order.
+
+    The package contains the original base, the immutable result, the
+    deterministic RFC 6902 patch between them, every audit event and the
+    generation timestamp, and is HMAC-signed with the configured secret key.
+    Raises MergeNotFound (404) for an unknown merge and MergeNotResolved
+    (409) while the merge is still pending.
+    """
+    from . import evidence
+
+    row = db.query_one(
+        "SELECT status, base_doc, result FROM merges WHERE id = ?",
+        (merge_id,),
+    )
+    if row is None:
+        raise MergeNotFound(merge_id)
+    if row["status"] != STATUS_RESOLVED or row["result"] is None:
+        raise MergeNotResolved(merge_id)
+    base = json.loads(row["base_doc"])
+    result = json.loads(row["result"])
+    trail = audit.get_audit_trail(merge_id)
+    return evidence.export_package(
+        merge_id,
+        base,
+        result,
+        generate_patch(base, result),
+        trail["events"],
+    )
+
+
 def get_audit_trail(merge_id: str) -> dict:
     """Return the merge order's adjudication audit trail and chain verdict.
 

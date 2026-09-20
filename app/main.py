@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import db, store
+from . import db, evidence, store
 from .analysis import analyze_merge
 from .models import (
     DraftUpdateRequest,
@@ -23,6 +23,9 @@ from .validation import InvalidResultSchema, ResultValidationFailed
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # The evidence HMAC key is validated before anything else: a missing or
+    # too-short EVIDENCE_SECRET_KEY must keep the service from serving.
+    evidence.init_signing_key()
     # Dependencies are installed at image build; tables are created here,
     # so a single `docker compose up` brings up a ready-to-use service.
     db.init_schema()
@@ -258,6 +261,39 @@ def get_merge_audit(merge_id: str):
     sequence number. Unknown merge: 404.
     """
     return store.get_audit_trail(merge_id)
+
+
+@app.get("/merges/{merge_id}/evidence")
+def get_merge_evidence(merge_id: str):
+    """Portable evidence package of a resolved merge order.
+
+    Available once the merge is resolved: 409 while pending, 404 if
+    unknown. The self-contained package carries the original ``base``, the
+    immutable ``result``, the deterministic RFC 6902 ``patch`` between
+    them, the complete chained ``audit`` history and a generation
+    timestamp, normalised (canonical key order) and signed with
+    HMAC-SHA256 using the server's EVIDENCE_SECRET_KEY. POST the body back
+    to /evidence/verify on any holder of the same key to verify it
+    offline — the verifier never touches the database.
+    """
+    return store.export_evidence_package(merge_id)
+
+
+@app.post("/evidence/verify")
+async def verify_evidence(request: Request):
+    """Verify a portable evidence package without any database access.
+
+    The raw JSON body is the package produced by GET .../evidence. Checks
+    run in fixed order — signature (constant-time compare), audit-chain
+    continuity, then a real replay of the patch against base to confirm
+    result — and the response reports the first failing stage and reason
+    (or ``valid: true``). Malformed JSON fails at the signature stage.
+    """
+    try:
+        package = await request.json()
+    except Exception:
+        return evidence.malformed_body_verdict()
+    return evidence.verify_package(package)
 
 
 def _resolution_items(body: ResolveRequest | DraftUpdateRequest) -> list[dict]:

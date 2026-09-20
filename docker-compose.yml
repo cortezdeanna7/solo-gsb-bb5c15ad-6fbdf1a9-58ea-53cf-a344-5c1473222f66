@@ -5,6 +5,11 @@ services:
       - "8000:8000"
     environment:
       DATABASE_PATH: /data/merges.db
+      # HMAC-SHA256 key for portable evidence packages. REQUIRED: the service
+      # intentionally fails to start when it is unset/blank or shorter than
+      # 32 characters. Compose fails fast here when the host lacks it (see
+      # README for .env / shell export configuration).
+      EVIDENCE_SECRET_KEY: ${EVIDENCE_SECRET_KEY:?set a >=32-char secret, e.g. export EVIDENCE_SECRET_KEY=...}
     volumes:
       - merge-data:/data
     restart: unless-stopped

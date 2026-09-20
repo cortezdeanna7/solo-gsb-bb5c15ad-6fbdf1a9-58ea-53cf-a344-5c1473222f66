@@ -7,19 +7,37 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 
-from .audit import METHODS
-
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "./merges.db")
 
 _lock = threading.Lock()
 _conn: sqlite3.Connection | None = None
 
-# Used in the audit table's CHECK constraint: "... method IN ('resolutions',
-# 'rule-resolutions', ...)". Rebuilt whenever a new method (resolution-undo)
-# is introduced, so existing database files keep accepting events.
-_AUDIT_METHODS_SQL = ", ".join(f"'{method}'" for method in METHODS)
 
-SCHEMA = f"""
+def _audit_table_sql(methods_sql: str) -> str:
+    """CREATE TABLE statement for the audit table with a given method list."""
+    return f"""
+CREATE TABLE IF NOT EXISTS merge_audit_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    merge_id        TEXT NOT NULL REFERENCES merges (id),
+    seq             INTEGER NOT NULL,
+    method          TEXT NOT NULL CHECK (method IN ({methods_sql})),
+    revision_before INTEGER NOT NULL,
+    revision_after  INTEGER NOT NULL,
+    pointers        TEXT NOT NULL,
+    detail          TEXT NOT NULL,
+    prev_hash       TEXT NOT NULL,
+    hash            TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    UNIQUE (merge_id, seq)
+)
+"""
+
+
+def _schema(methods_sql: str) -> str:
+    # The audit table's CHECK lists the adjudication methods; they come from
+    # audit.METHODS lazily so module import order never creates an import
+    # cycle (audit imports db, and db must not import audit at module load).
+    return f"""
 CREATE TABLE IF NOT EXISTS merges (
     id              TEXT PRIMARY KEY,
     idempotency_key TEXT UNIQUE,
@@ -58,20 +76,7 @@ CREATE TABLE IF NOT EXISTS merge_drafts (
 
 -- Adjudication audit trail: one row per successful state-changing
 -- resolution request, chained per merge order via prev_hash/hash.
-CREATE TABLE IF NOT EXISTS merge_audit_events (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    merge_id        TEXT NOT NULL REFERENCES merges (id),
-    seq             INTEGER NOT NULL,
-    method          TEXT NOT NULL CHECK (method IN ({_AUDIT_METHODS_SQL})),
-    revision_before INTEGER NOT NULL,
-    revision_after  INTEGER NOT NULL,
-    pointers        TEXT NOT NULL,
-    detail          TEXT NOT NULL,
-    prev_hash       TEXT NOT NULL,
-    hash            TEXT NOT NULL,
-    created_at      TEXT NOT NULL,
-    UNIQUE (merge_id, seq)
-);
+{_audit_table_sql(methods_sql)}
 """
 
 
@@ -99,7 +104,7 @@ _MIGRATIONS = (
 )
 
 
-def _audit_table_accepts_all_methods(conn: sqlite3.Connection) -> bool:
+def _audit_table_accepts_all_methods(conn: sqlite3.Connection, methods) -> bool:
     """Whether the stored audit table's CHECK already lists every method.
 
     A database file created before ``resolution-undo`` existed keeps the
@@ -119,42 +124,30 @@ def _audit_table_accepts_all_methods(conn: sqlite3.Connection) -> bool:
     # membership on that exact token is independent of the constraint's
     # spacing/line breaks.
     constraint = create_sql["sql"]
-    return all(f"'{method}'" in constraint for method in METHODS)
+    return all(f"'{method}'" in constraint for method in methods)
 
 
 def init_schema() -> None:
+    # Resolved lazily to avoid an import cycle at module load: audit imports
+    # db, and db must not import audit until both modules are loaded.
+    from .audit import METHODS
+
+    audit_methods_sql = ", ".join(f"'{method}'" for method in METHODS)
     with _lock:
         conn = connect()
-        conn.executescript(SCHEMA)
+        conn.executescript(_schema(audit_methods_sql))
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(merges)")}
         for statement, column in _MIGRATIONS:
             if column not in existing:
                 conn.execute(statement)
-        if not _audit_table_accepts_all_methods(conn):
+        if not _audit_table_accepts_all_methods(conn, METHODS):
             # SQLite cannot ALTER a CHECK constraint: rebuild the table,
             # copying every stored event verbatim (hashes preserved).
             # Bound parameters are prohibited inside CHECK constraints, so
             # the method list (a fixed code constant, never user input) is
-            # interpolated like in SCHEMA above.
+            # interpolated like in the schema above.
             conn.execute("ALTER TABLE merge_audit_events RENAME TO merge_audit_events_old")
-            conn.execute(
-                f"""
-                CREATE TABLE merge_audit_events (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    merge_id        TEXT NOT NULL REFERENCES merges (id),
-                    seq             INTEGER NOT NULL,
-                    method          TEXT NOT NULL CHECK (method IN ({_AUDIT_METHODS_SQL})),
-                    revision_before INTEGER NOT NULL,
-                    revision_after  INTEGER NOT NULL,
-                    pointers        TEXT NOT NULL,
-                    detail          TEXT NOT NULL,
-                    prev_hash       TEXT NOT NULL,
-                    hash            TEXT NOT NULL,
-                    created_at      TEXT NOT NULL,
-                    UNIQUE (merge_id, seq)
-                )
-                """
-            )
+            conn.execute(_audit_table_sql(audit_methods_sql))
             conn.execute(
                 """
                 INSERT INTO merge_audit_events (
