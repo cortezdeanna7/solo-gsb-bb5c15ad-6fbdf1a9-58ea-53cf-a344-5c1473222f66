@@ -7,10 +7,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import db, store
+from . import db, evidence, store
 from .analysis import analyze_merge
 from .models import (
     DraftUpdateRequest,
+    EvidencePackage,
     MergeAnalysisRequest,
     MergeCreate,
     ResolutionUndoRequest,
@@ -23,6 +24,10 @@ from .validation import InvalidResultSchema, ResultValidationFailed
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Fail fast: evidence packages are signed with a key from the
+    # environment, so a missing or too-short key aborts the startup
+    # instead of surfacing later as failing evidence requests.
+    evidence.get_signing_key()
     # Dependencies are installed at image build; tables are created here,
     # so a single `docker compose up` brings up a ready-to-use service.
     db.init_schema()
@@ -258,6 +263,47 @@ def get_merge_audit(merge_id: str):
     sequence number. Unknown merge: 404.
     """
     return store.get_audit_trail(merge_id)
+
+
+# ---------------------------------------------------------------------------
+# Portable evidence packages
+# ---------------------------------------------------------------------------
+
+
+@app.get("/merges/{merge_id}/evidence")
+def get_merge_evidence(merge_id: str):
+    """Export a signed portable evidence package for a resolved merge.
+
+    Only a resolved merge order can be exported: 409 while pending, 404
+    if unknown. The payload carries the original base document, the
+    immutable result, the deterministic RFC 6902 patch from base to
+    result, the complete adjudication audit events and the generation
+    time; it is signed with HMAC-SHA256 over its canonical JSON using the
+    key from the EVIDENCE_HMAC_KEY environment variable. The package can
+    be verified anywhere with POST /evidence/verify — no database needed.
+    """
+    return store.export_evidence(merge_id)
+
+
+@app.post("/evidence/verify")
+def verify_evidence(body: EvidencePackage):
+    """Verify an exported evidence package without any database access.
+
+    The stages run in a fixed order and the response names the first
+    failing one together with its reason:
+
+    1. ``signature`` — the HMAC-SHA256 is recomputed over the payload's
+       canonical JSON and compared to the packaged signature in constant
+       time;
+    2. ``audit_chain`` — the packaged audit events are re-hashed and
+       checked for sequence and prev-hash continuity;
+    3. ``patch_replay`` — the patch is actually applied to ``base`` and
+       must reproduce the packaged immutable ``result`` exactly.
+
+    A package passing every stage yields ``{"valid": true}``; a
+    structurally malformed body yields 422 before any stage runs.
+    """
+    return evidence.verify_package(body.model_dump())
 
 
 def _resolution_items(body: ResolveRequest | DraftUpdateRequest) -> list[dict]:

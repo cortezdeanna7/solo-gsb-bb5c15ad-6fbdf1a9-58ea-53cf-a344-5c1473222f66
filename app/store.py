@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from . import audit, db, rules, undo
+from . import audit, db, evidence, rules, undo
 from .merge import MISSING, delete_at, merge3, parse_pointer, set_at
 from .patch import generate_patch, sha256_hex
 from .reuse import (
@@ -146,6 +146,31 @@ def get_audit_trail(merge_id: str) -> dict:
     if db.query_one("SELECT id FROM merges WHERE id = ?", (merge_id,)) is None:
         raise MergeNotFound(merge_id)
     return audit.get_audit_trail(merge_id)
+
+
+def export_evidence(merge_id: str) -> dict:
+    """Build the signed portable evidence package for a resolved merge.
+
+    The package carries the original base document, the immutable result,
+    the deterministic base-to-result patch, the complete audit history and
+    the generation time, signed with the configured HMAC key. Raises
+    MergeNotFound (404) for an unknown merge and MergeNotResolved (409)
+    while the merge is still pending.
+    """
+    row = db.query_one(
+        "SELECT status, base_doc, result FROM merges WHERE id = ?",
+        (merge_id,),
+    )
+    if row is None:
+        raise MergeNotFound(merge_id)
+    if row["status"] != STATUS_RESOLVED or row["result"] is None:
+        raise MergeNotResolved(merge_id)
+    return evidence.build_package(
+        merge_id,
+        json.loads(row["base_doc"]),
+        json.loads(row["result"]),
+        audit.list_event_dicts(merge_id),
+    )
 
 
 def create_merge(

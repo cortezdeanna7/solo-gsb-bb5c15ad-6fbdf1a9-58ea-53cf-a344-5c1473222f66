@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class MergeCreate(BaseModel):
@@ -98,3 +98,52 @@ class DraftUpdateRequest(BaseModel):
 
 class ResolutionUndoRequest(BaseModel):
     revision: int = Field(..., description="Current merge revision (409 if stale)")
+
+
+class EvidenceAuditEvent(BaseModel):
+    """One audit event as embedded in an evidence package.
+
+    Extra fields are forbidden: anything beyond the exported shape means
+    the package was not produced by this service.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    seq: int
+    method: str
+    revision_before: int
+    revision_after: int
+    pointers: list[Any]
+    detail: dict[str, Any]
+    prev_hash: str
+    hash: str
+    created_at: str
+
+
+class EvidencePayload(BaseModel):
+    """The signed payload of a portable evidence package."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    format: str = Field(..., description="Payload format marker, e.g. merge-evidence/1")
+    merge_id: str
+    generated_at: str = Field(..., description="Package generation time (UTC ISO 8601)")
+    base: Any = Field(..., description="Original common-ancestor document")
+    result: Any = Field(..., description="Immutable final result document")
+    patch: list[dict[str, Any]] = Field(
+        ..., description="Deterministic RFC 6902 patch from base to result"
+    )
+    audit: list[EvidenceAuditEvent] = Field(
+        ..., description="Complete adjudication audit events, in sequence order"
+    )
+
+
+class EvidencePackage(BaseModel):
+    """An exported evidence package: signed payload plus its HMAC-SHA256."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    payload: EvidencePayload
+    signature: str = Field(
+        ..., description="HMAC-SHA256 hex digest of the payload's canonical JSON"
+    )

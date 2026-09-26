@@ -158,7 +158,8 @@ def record_event(
     )
 
 
-def _row_to_event(row, valid: bool) -> dict:
+def _raw_event(row) -> dict:
+    """The event exactly as stored, without any verification artifact."""
     return {
         "seq": row["seq"],
         "method": row["method"],
@@ -169,8 +170,63 @@ def _row_to_event(row, valid: bool) -> dict:
         "prev_hash": row["prev_hash"],
         "hash": row["hash"],
         "created_at": row["created_at"],
-        "valid": valid,
     }
+
+
+def _row_to_event(row, valid: bool) -> dict:
+    event = _raw_event(row)
+    event["valid"] = valid
+    return event
+
+
+def list_event_dicts(merge_id: str) -> list[dict]:
+    """All of the merge order's events as plain dicts, in sequence order.
+
+    Used to embed the complete adjudication history into an exported
+    evidence package; the events carry their stored ``prev_hash``/``hash``
+    so the chain can be re-verified later without database access.
+    """
+    rows = db.query_all(
+        "SELECT * FROM merge_audit_events WHERE merge_id = ? ORDER BY seq ASC",
+        (merge_id,),
+    )
+    return [_raw_event(row) for row in rows]
+
+
+def verify_event_dicts(merge_id: str, events: list[dict]) -> int | None:
+    """Verify a chain of event dicts; return the first anomalous seq or None.
+
+    Pure: no database access, so an exported evidence package's audit
+    history can be verified anywhere. Every event is re-hashed from its
+    own fields and checked for sequence continuity and prev-hash linkage
+    against its predecessor (the first event must chain from the genesis
+    prev-hash), exactly like the stored-chain verification.
+    """
+    expected_seq = 1
+    prev_hash = GENESIS_PREV_HASH
+    for event in events:
+        payload = _payload(
+            merge_id,
+            event["seq"],
+            event["method"],
+            event["revision_before"],
+            event["revision_after"],
+            event["pointers"],
+            event["detail"],
+            event["prev_hash"],
+            event["created_at"],
+        )
+        if (
+            event["seq"] != expected_seq
+            or event["prev_hash"] != prev_hash
+            or compute_hash(payload) != event["hash"]
+        ):
+            return event["seq"]
+        # Walk the *carried* values, so one anomalous event does not mask
+        # the integrity of its untouched successors.
+        expected_seq = event["seq"] + 1
+        prev_hash = event["hash"]
+    return None
 
 
 def _verify_rows(rows) -> tuple[int | None, dict[int, bool]]:

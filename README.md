@@ -17,6 +17,19 @@ docker compose up --build
 
 SQLite 数据文件持久化在名为 `merge-data` 的 Docker volume 中（容器内路径 `/data/merges.db`，可通过环境变量 `DATABASE_PATH` 修改）。
 
+### 签名密钥配置（`EVIDENCE_HMAC_KEY`）
+
+证据包（见下文「可移植证据包」）使用 **HMAC-SHA256** 签名，密钥来自环境变量 **`EVIDENCE_HMAC_KEY`**：
+
+- **缺少该变量、或密钥不足 32 字节时，应用拒绝启动**（启动即报错退出），避免运行中的服务无法签发/校验证据包；
+- `docker-compose.yml` 内置了一个**仅供本地开发**的默认值，保证 `docker compose up --build` 单命令可启动；任何真实部署都必须覆盖它：
+
+```bash
+EVIDENCE_HMAC_KEY=<至少 32 字节的随机密钥> docker compose up --build
+```
+
+本地直接运行（非 Docker）时同样需要：`export EVIDENCE_HMAC_KEY=<...>` 后再 `uvicorn app.main:app --port 8000`。
+
 ## 合并规则
 
 按 JSON Pointer（RFC 6901）逐路径递归：
@@ -55,6 +68,8 @@ SQLite 数据文件持久化在名为 `merge-data` 的 Docker volume 中（容�
 | `POST` | `/merges/{merge_id}/drafts/{draft_id}/commit` | 单事务提交草案：重校验后一次性应用全部取值并使草案失效 |
 | `GET` | `/merges/{merge_id}/patch` | resolved 后：base → result 的 RFC 6902 补丁（含 SHA-256） |
 | `GET` | `/merges/{merge_id}/audit` | 裁决审计链：按序返回全部裁决事件及逐合并单 SHA-256 链校验结果 |
+| `GET` | `/merges/{merge_id}/evidence` | 导出可移植证据包：base、不可变 result、确定性 patch、完整审计事件与生成时间的签名载荷（仅 resolved） |
+| `POST` | `/evidence/verify` | 校验证据包（不访问数据库）：常量时间比对签名 → 审计链连续性 → 重放 patch，按固定顺序返回首个失败阶段 |
 | `GET` | `/health` | 健康检查 |
 
 ### 1. 创建合并单 — `POST /merges`
@@ -621,32 +636,103 @@ curl -s -X POST http://localhost:8000/merge-analysis \
 - 缺少 `base` / `left` / `right` 任一字段 → **`422`**；字段类型可为任意合法 JSON（标量、数组、对象、`null`）。
 - 该接口不接受也不需要 `revision`、`idempotency_key` 或 `result_schema`；它不产生任何副作用，可安全反复调用。
 
+### 12. 可移植证据包 — `GET /merges/{merge_id}/evidence` + `POST /evidence/verify`
+
+合并单 `resolved` 后，可把它导出为一个**自包含、可离线校验的证据包**：包里带有重建与审计该次合并所需的全部内容，并用 HMAC-SHA256 签名，之后在任何地方（无需访问本服务数据库）都能验证其真实性与完整性。
+
+**导出**（仅接受 `resolved` 合并单；`pending` → **`409`**，不存在 → **`404`**）：
+
+```bash
+curl -s http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/evidence
+```
+
+```json
+{
+  "payload": {
+    "format": "merge-evidence/1",
+    "merge_id": "bc6d2c3d9a3343bf9177147a10ec4023",
+    "generated_at": "2026-09-26T03:36:35.598099+00:00",
+    "base": { "...": "原始 base 文档" },
+    "result": { "...": "不可变最终结果" },
+    "patch": [
+      {"op": "replace", "path": "/db/host", "value": "b"}
+    ],
+    "audit": [
+      {
+        "seq": 1,
+        "method": "resolutions",
+        "revision_before": 1,
+        "revision_after": 2,
+        "pointers": ["/db/host"],
+        "detail": {"items": [{"pointer": "/db/host", "choice": "left"}]},
+        "prev_hash": "0000…0000",
+        "hash": "3d25…",
+        "created_at": "2026-09-20T03:36:35.598099+00:00"
+      }
+    ]
+  },
+  "signature": "9c1f…（64 位十六进制 HMAC-SHA256）"
+}
+```
+
+- **规范化载荷**：`payload` 固定包含 `format`、`merge_id`、`generated_at`（UTC ISO 8601 生成时间）、`base`、不可变 `result`、确定性 RFC 6902 `patch`（与 `GET /merges/{merge_id}/patch` 完全一致）以及**完整审计事件**（含 `prev_hash` / `hash` 链节，不含服务端校验产物 `valid` 字段）。
+- **签名**：`signature` 是对载荷**规范化 JSON**（键排序、无空白，与文档摘要/审计哈希同一序列化）计算的 **HMAC-SHA256** 十六进制摘要，密钥来自环境变量 `EVIDENCE_HMAC_KEY`（配置方式见上文「签名密钥配置」；未配置或过短时应用拒绝启动）。
+
+**校验**（把导出的整个 JSON 原样 POST 回来；**不访问数据库**，合并单即使已删除也能校验）：
+
+```bash
+curl -s -X POST http://localhost:8000/evidence/verify \
+  -H 'Content-Type: application/json' \
+  -d @evidence-package.json
+```
+
+校验按**固定顺序**执行三个阶段，并返回**首个失败阶段及原因**：
+
+| 顺序 | 阶段 | 检查内容 |
+| --- | --- | --- |
+| 1 | `signature` | 用同一密钥对载荷规范化 JSON 重算 HMAC-SHA256，与包内签名做**常量时间**比较；载荷被篡改或签名伪造（含用错密钥）都在此失败 |
+| 2 | `audit_chain` | 重放包内审计事件：序号连续、`prev_hash` 衔接、逐事件重算哈希（与 `GET .../audit` 的链校验规则一致）；断链时 `reason` 指明首个异常事件的 `seq` |
+| 3 | `patch_replay` | 把 `patch` **实际重放**到 `base` 上，结果必须与包内不可变 `result` 完全相等（JSON 精确相等：`1` ≠ `true` ≠ `1.0`）；补丁无法应用或重放结果不符都在此失败 |
+
+响应（全部通过 / 任一阶段失败）：
+
+```json
+{"valid": true, "failed_stage": null, "reason": null}
+{"valid": false, "failed_stage": "signature", "reason": "signature mismatch: ..."}
+```
+
+- 阶段顺序固定：签名失败会掩盖后续阶段（载荷不可信，不再检查链与补丁）；链失败先于补丁重放报告。
+- 请求体结构不合法（缺字段、多字段、事件结构不符）→ **`422`**，在进入任何校验阶段之前拒绝。
+- 校验只依赖包内容与 `EVIDENCE_HMAC_KEY`，不读取 SQLite，因此适合把证据包交给第三方或归档系统独立核验。
+
 ## 本地开发与测试
 
 ```bash
 pip install -r requirements.txt
 pip install httpx pytest
+export EVIDENCE_HMAC_KEY=<至少 32 字节的密钥>   # 证据包签名密钥，缺失或过短无法启动
 uvicorn app.main:app --reload --port 8000   # 本地运行
-python -m pytest tests/ -q                  # 运行测试（188 项）
+python -m pytest tests/ -q                  # 运行测试（210 项）
 ```
 
 ## 项目结构
 
 ```
 app/
-  main.py       # FastAPI 路由与错误映射（404/409/400/422）
+  main.py       # FastAPI 路由与错误映射（404/409/400/422）；启动时强制检查证据包签名密钥
   analysis.py   # 合并前影响分析：纯内存三方联合遍历，四类 change records + would_conflict（不落库）
   merge.py      # 纯 Python 三方合并引擎（JSON Pointer 递归）
   rules.py      # RFC 6901 风格路径模式（* 与 **）：规则编译、匹配、批量裁决
   reuse.py      # 历史裁决复用：指针 + base/left/right/missing 规范化匹配、来源结果取值/删除
   undo.py       # 撤销上一批裁决：初始快照 + 审计事件重放重建文档与开放冲突
-  patch.py      # 确定性 RFC 6902 补丁生成 + 规范化 SHA-256
+  patch.py      # 确定性 RFC 6902 补丁生成/严格重放 + 规范化 SHA-256
   validation.py # Draft 2020-12 结果门禁：元 schema 校验 + 最终结果校验（422 错误排序）
-  audit.py      # 裁决审计：同事务事件追加 + 逐合并单 SHA-256 哈希链校验
-  store.py      # 合并单状态机 + 解决草案 + 历史复用 + 撤销：revision 校验、冲突解决、不可变结果、schema 门禁
+  audit.py      # 裁决审计：同事务事件追加 + 逐合并单 SHA-256 哈希链校验（含纯函数链校验供证据包使用）
+  evidence.py   # 可移植证据包：规范化载荷 + HMAC-SHA256 签名；免数据库三阶段校验（签名→审计链→补丁重放）
+  store.py      # 合并单状态机 + 解决草案 + 历史复用 + 撤销 + 证据包导出：revision 校验、冲突解决、不可变结果、schema 门禁
   db.py         # SQLite 连接与建表（启动时执行，含轻量列迁移、审计表 CHECK 扩展与单事务提交支持）
-  models.py     # Pydantic 请求模型（含可选 result_schema、草案编辑、历史复用、撤销请求）
-tests/          # 合并引擎/补丁单测 + API 端到端测试（含 schema 门禁、草案、历史复用、审计链与撤销重放测试）
+  models.py     # Pydantic 请求模型（含可选 result_schema、草案编辑、历史复用、撤销请求、证据包校验请求）
+tests/          # 合并引擎/补丁单测 + API 端到端测试（含 schema 门禁、草案、历史复用、审计链、撤销重放与证据包篡改/伪造/断链/错误补丁测试）
 Dockerfile
 docker-compose.yml
 requirements.txt
